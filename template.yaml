@@ -1,0 +1,251 @@
+# This is the SAM template that represents the architecture of your serverless application
+# https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-template-basics.html
+
+#--Boiler plate--#
+#
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  client-portal-backend
+
+Transform:
+- AWS::Serverless-2016-10-31
+
+#-- END --#
+Parameters:
+  StageName:
+    Type: String
+    Default: dev
+  CognitoClientSecret:
+    Type: String
+  CognitoAppClientId:
+    Type: String
+  RoleArn:
+    Type: String
+
+# Resources declares the AWS resources that you want to include in the stack
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/resources-section-structure.html
+Resources:
+  # Stores user data for client data portal 
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: "ClientPortalUserPool"
+      UsernameAttributes:
+        - email
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      MfaConfiguration: OPTIONAL
+      Schema:
+        - AttributeDataType: String
+          Name: email
+          Required: true
+        - AttributeDataType: String
+          Name: given_name
+          Required: true
+        - AttributeDataType: String
+          Name: family_name
+          Required: true
+        - AttributeDataType: String
+          Name: client_uuid
+          Required: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !GetAtt UserPool.UserPoolId
+      AccessTokenValidity: 1
+      ClientName: ClientPortalUserPoolClient
+      ExplicitAuthFlows: 
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      GenerateSecret: true 
+  
+  AuthorizerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub authorizer-access-role-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLambdaInsightsExecutionRolePolicy    
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  HandlerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "lambda-execution-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+         - Effect: Allow
+           Principal:
+              Service: 
+              - lambda.amazonaws.com
+           Action:
+             - sts:AssumeRole
+         - Effect: Allow
+           Principal:
+             AWS: !GetAtt AuthorizerExecutionRole.Arn
+           Action:
+              sts:AssumeRole
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/CloudWatchLambdaInsightsExecutionRolePolicy    
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  PresignedPutRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "presigned-put-role-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+         - Effect: Allow
+           Principal:
+              Service: 
+              - lambda.amazonaws.com
+           Action:
+             - sts:AssumeRole
+         - Effect: Allow
+           Principal:
+             AWS: !GetAtt AuthorizerExecutionRole.Arn
+           Action:
+              sts:AssumeRole
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/CloudWatchLambdaInsightsExecutionRolePolicy    
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+      Auth:
+        DefaultAuthorizer: LambdaAuthorizerFunc
+        Authorizers:
+          LambdaAuthorizerFunc:
+            AuthorizerPayloadFormatVersion: "2.0"
+            EnableFunctionDefaultPermissions: true
+            FunctionArn: 
+              !GetAtt LambdaAuthorizerFunc.Arn
+            Identity:
+              # See https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-lambda-authorizer.html#http-api-lambda-authorizer.identity-sources
+              Headers:
+                - Authorization 
+              ReauthorizeEvery: 300
+      FailOnWarnings: true
+      Domain:
+        DomainName: api.metricdataanalytics.com
+        CertificateArn: arn:aws:acm:us-west-2:183417282099:certificate/e350b7ea-d5ab-4b7a-aba3-857aa89c950d
+
+         
+  LambdaAuthorizerFunc:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/authorizer/
+      Handler: custom_auth.authorize
+      Runtime: nodejs20.x
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 100
+      Role: !GetAtt AuthorizerExecutionRole.Arn
+      Environment:
+        Variables:
+            COGNITO_APP_CLIENT_ID: !Ref CognitoAppClientId
+            COGNITO_CLIENT_SECRET: !Ref CognitoClientSecret
+            AWS_ACCOUNT_ID: !Ref "AWS::AccountId"
+            REGION: !Ref "AWS::Region"
+            ROLEARN: !Ref "RoleArn"
+
+  HelperFunctionsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: src/layers/helpers
+    Metadata:
+      BuildMethod: nodejs20.x
+      BuildArchitecture: x86_64
+ 
+  ListFilesFunction: 
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/list-files.LambdaHandler
+      Runtime: nodejs20.x
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 100
+      Description: Return files in bucket for current user 
+      Layers:
+        - !Ref HelperFunctionsLayer
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /files
+            Method: get
+            PayloadFormatVersion: "2.0"
+      Role:
+        !GetAtt HandlerExecutionRole.Arn
+
+  PresignedGetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/presigned-get.LambdaHandler
+      Runtime: nodejs20.x
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 100
+      Description: Get presigned URL for file download 
+      Layers:
+        - !Ref HelperFunctionsLayer
+      Events:
+        PresignedGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /files/{file_name}
+            Method: get
+      Role: 
+        !GetAtt HandlerExecutionRole.Arn
+
+  PresignedPostFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/presigned-post.LambdaHandler
+      Runtime: nodejs20.x
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 100
+      Description: Get presigned URL for file upload
+      Layers:
+        - !Ref HelperFunctionsLayer
+      Events:
+        PresignedGet:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /files/upload
+            Method: post
+      Role:
+        !GetAtt HandlerExecutionRole.Arn
+
+Outputs:
+  Api:
+    Description: "API Gateway endpoint url"
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${StageName}/
+  HandlerIAMRole:
+    Description: "IAM Role for S3 Access"
+    Value: !GetAtt HandlerExecutionRole.Arn
+
+      
